@@ -1,0 +1,170 @@
+name: Deploy Elastic to AKS or Rancher
+on:
+  workflow_dispatch:
+    inputs:
+      target_platform:
+        description: 'Select Platform'
+        required: true
+        default: 'aks'
+        type: choice
+        options:
+          - aks
+          - rancher
+      target_environment:
+        description: 'Select Environment'
+        required: true
+        default: 'NON-CUS'
+        type: environment
+      target_instance:
+        description: 'Select Instance'
+        required: true
+        default: '1'
+        type: choice
+        options:
+          - "1"
+          - "2"
+          - "3"
+env: 
+  PLATFORM: "${{ github.event.inputs.target_platform }}"
+  ENVIRONMENT: "${{ github.event.inputs.target_environment }}"  
+  RESOURCE_GROUP: "${{ vars.AKS_RESOURCE_GROUP }}"
+  INSTANCE: "${{ github.event.inputs.target_instance }}"
+  IMG_PULL_SECRET: 'imagePullSecrets:\n - name: acrpull-secret'
+  
+jobs:
+  setup-environment:
+    runs-on: self-hosted
+    environment: ${{ github.event.inputs.target_environment }}
+    steps:
+      # Step 1: Checkout the repository (if needed)
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Debug Inputs
+        run: |
+            echo "Target Platform: ${{ github.event.inputs.target_platform }}"
+            echo "Target Environment: ${{ github.event.inputs.target_environment }}"
+            echo "Resource Group: ${{ github.event.inputs.resource_group }}"
+            echo "RESOURCE_GROUP: ${{ env.RESOURCE_GROUP }} "
+
+      - name: Setup Shell environment
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y wget apt-transport-https software-properties-common jq ca-certificates curl lsb-release gnupg unzip
+
+      - name: Install AZ CLI
+        run: |
+          sudo apt-get install -y ca-certificates curl apt-transport-https lsb-release gnupg
+          curl -sL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor | sudo tee /etc/apt/trusted.gpg.d/microsoft.gpg > /dev/null
+          AZ_REPO=$(lsb_release -cs)
+          echo "deb [arch=amd64] https://packages.microsoft.com/repos/azure-cli/ $AZ_REPO main" | sudo tee /etc/apt/sources.list.d/azure-cli.list
+          sudo apt-get update
+          sudo apt-get install -y azure-cli
+
+      - name: Set up kubelogin for non-interactive login
+        run: |
+          curl -LO https://github.com/Azure/kubelogin/releases/download/v0.1.3/kubelogin-linux-amd64.zip
+          unzip kubelogin-linux-amd64.zip
+          sudo install -o root -g root -m 0755 bin/linux_amd64/kubelogin /usr/local/bin/kubelogin
+
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+
+       # Step 2: Azure CLI login
+      - name: Test AZ CLI
+        run: |
+          az version
+          echo "AZ CLI is operational..."
+        
+      - name: Construct AZURE_CREDENTIALS
+        id: construct_credentials
+        run: |
+          echo "Constructing AZURE_CREDENTIALS JSON..."
+          echo '{}' | jq \
+            --arg clientId "${{ secrets.AZURE_CLIENT_ID }}" \
+            --arg clientSecret "${{ secrets.AZURE_CLIENT_SECRET }}" \
+            --arg subscriptionId "${{ secrets.AZURE_SUBSCRIPTION_ID }}" \
+            --arg tenantId "${{ secrets.AZURE_TENANT_ID }}" \
+            --arg activeDirectoryEndpointUrl "https://login.microsoftonline.com" \
+            --arg resourceManagerEndpointUrl "https://management.azure.com/" \
+            --arg activeDirectoryGraphResourceId "https://graph.windows.net/" \
+            --arg sqlManagementEndpointUrl "https://management.core.windows.net:8443/" \
+            --arg galleryEndpointUrl "https://gallery.azure.com/" \
+            --arg managementEndpointUrl "https://management.core.windows.net/" \
+            '.clientId=$clientId | .clientSecret=$clientSecret | .subscriptionId=$subscriptionId | .tenantId=$tenantId | .activeDirectoryEndpointUrl=$activeDirectoryEndpointUrl | .resourceManagerEndpointUrl=$resourceManagerEndpointUrl | .activeDirectoryGraphResourceId=$activeDirectoryGraphResourceId | .sqlManagementEndpointUrl=$sqlManagementEndpointUrl | .galleryEndpointUrl=$galleryEndpointUrl | .managementEndpointUrl=$managementEndpointUrl' \
+            > azure_credentials.json
+          echo "AZURE_CREDENTIALS<<EOF" >> $GITHUB_ENV
+          cat azure_credentials.json >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+          
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ env.AZURE_CREDENTIALS }}
+
+      - name: Set AKS Context
+        if: ${{ github.event.inputs.target_platform == 'aks' }} 
+        uses: azure/aks-set-context@v4
+        with:
+          subscription: "${{ vars.AZURE_SUBSCRIPTION_ID }}"
+          resource-group: "${{ vars.AKS_RESOURCE_GROUP }}" 
+          cluster-name: "${{ vars.AZURE_KUBERNETES }}" 
+          admin: false  # Set to true if using admin credentials
+          use-kubelogin: true
+          
+      - name: Deploy Elastic Components
+        run: |
+          cd ./elastic
+          ENV_NAME="${{ env.ENVIRONMENT }}.${{ env.INSTANCE }}"
+          echo "ENV_NAME: $ENV_NAME"
+          if [ "${{ env.PLATFORM }}" == "aks" ]; then
+          echo "AKS being used"
+          sed -i 's|@#acr#@|${{ vars.ACR_REGISTRY }}|g' ./eck/operator.yaml
+          sed -i "s/@#ns#@/elastic-system/g" ./eck/operator.yaml
+
+          sed -i "s/@#ns#@/elastic-system/g" ./ek/elasticsearch.yaml
+          sed -i "s/@#sc#@/managed-premium/g" ./ek/elasticsearch.yaml
+
+          sed -i "s/@#ns#@/elastic-system/g" ./ek/kibana.yaml
+
+          sed -i "s|@#env#@|$ENV_NAME|g" ./ek/kibana-vsr.yaml
+          sed -i "s/@#host#@/${INGRESS_MONITOR_HOSTNAME}/g" ./ek/kibana-vsr.yaml
+          sed -i "s/@#ns#@/elastic-system/g" ./ek/kibana-vsr.yaml
+
+          cat ./ek/elasticsearch.yaml
+          
+          # kubectl apply -f ./eck/crds.yaml
+          # kubectl apply -f ./ek/elasticsearch.yaml
+          # kubectl apply -f ./ek/kibana.yaml
+          # kubectl apply -f ./ek/kibana-vsr.yaml
+             
+          #  kubelogin convert-kubeconfig -l azurecli
+          elif [ "${{ env.PLATFORM }}" == "rancher" ]; then
+            export KUBECONFIG="${HOME}/.kube/config-rancher-np"
+            echo "Rancher is being used"
+            sed -i 's|@#acr#@|${{ vars.ACR_REGISTRY }}|g' ./eck/operator.yaml
+            sed -i "s/@#ns#@/elastic-system/g" ./eck/operator.yaml
+            sed -i "s/@#imgpull#@/${{ env.IMG_PULL_SECRET }}/g" ./eck/operator.yaml
+
+            sed -i "s/@#ns#@/elastic-system/g" ./ek/elasticsearch.yaml
+            sed -i "s/@#sc#@/managed-premium/g" ./ek/elasticsearch.yaml
+            sed -i "s/@#imgpull#@/${{ env.IMG_PULL_SECRET }}/g" ./ek/elasticsearch.yaml
+
+            sed -i "s/@#ns#@/elastic-system/g" ./ek/kibana.yaml
+            sed -i "s/@#imgpull#@/${{ env.IMG_PULL_SECRET }}/g" ./ek/kibana.yaml
+
+            sed -i "s|@#env#@|$ENV_NAME|g" ./ek/kibana-vsr.yaml
+            sed -i "s/@#host#@/${INGRESS_MONITOR_HOSTNAME}/g" ./ek/kibana-vsr.yaml
+            sed -i "s/@#ns#@/elastic-system/g" ./ek/kibana-vsr.yaml
+
+            cat ./ek/elasticsearch.yaml
+          
+            kubectl apply -f ./eck/crds.yaml
+            kubectl apply -f ./ek/elasticsearch.yaml
+            kubectl apply -f ./ek/kibana.yaml
+            kubectl apply -f ./ek/kibana-vsr.yaml
+          
+            fi
+
