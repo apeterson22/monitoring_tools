@@ -1,0 +1,527 @@
+name: Deploy Components to AKS or Rancher
+run-name: Depolying "${{ github.event.inputs.app_name }}" to "${{ github.event.inputs.target_platform }}":"${{ github.event.inputs.environment }}"
+on:
+  workflow_dispatch:
+    inputs:
+      target_platform:
+        description: 'Select Platform'
+        required: true
+        default: 'rancher'
+        type: choice
+        options:
+          - aks
+          - rancher
+      environment:
+        description: 'Select Environment'
+        required: true
+        default: 'Dev.1'
+        type: environment
+      app_name:
+        description: 'Select Application to deploy'
+        required: true
+        default: '1'
+        type: choice
+        options:
+          - "Grafana"
+          - "Flunetd"
+          - "Elastic"
+          - "Rabbitmq"
+      # (Optional) If you want skip/apply logic for each sub-manifest of RabbitMQ:
+      apply_rmq_operator:
+        description: "Apply rabbitmq cluster-operator.yaml?"
+        required: false
+        type: boolean
+        default: false
+      apply_rmq_cluster:
+        description: "Apply rabbitmq.yaml?"
+        required: false
+        type: boolean
+        default: false
+      apply_rmq_vsr:
+        description: "Apply rabbitmq-vsr.yaml?"
+        required: false
+        type: boolean
+        default: false
+      # (Optional) If you want skip/apply logic for each sub-manifest of Grafana:
+      apply_grafana_yml:
+        description: "Apply Grafana.yaml?"
+        required: false
+        type: boolean
+        default: false
+      apply_grafana_svc:
+        description: "Apply grafana_svc.yaml?"
+        required: false
+        type: boolean
+        default: false
+      apply_grafana_pvc:
+        description: "Apply grafana-pvc.yaml?"
+        required: false
+        type: boolean
+        default: false
+      apply_grafana_vsr:
+        description: "Apply grafana-vsr.yaml?"
+        required: false
+        type: boolean
+        default: false
+      apply_grafana-ldap-configmap:
+        description: "Apply grafana-ldap-configmap?"
+        required: false
+        type: boolean
+        default: false
+env:
+  MAVEN_TOOL: "maven-3.8.6"
+  MAVEN_SETTINGS_XML: "${{ vars.MAVEN_SETTINGS_XML }}"
+  JF_URL: "${{ vars.JF_URL }}"
+  JF_ACCESS_TOKEN: "${{ secrets.JF_TOKEN }}"
+  JF_GIT_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+  BRANCH_NAME: "${{ github.event.inputs.environment }}"
+  JFROG_CLI_AVOID_NEW_VERSION_WARNING: true
+  SERVER_ID: "tsc-jfrog"
+  ARTIFACTORY_URL: "${{ vars.ARTIFACTORY_URL }}"
+  REPO_PATH: "${{ vars.ARTIFACTORY_REPO_PATH_EDF_NATIVE }}"
+  ARTIFACTORY_USER: "${{ vars.ARTIFACTORY_USER }}"
+  ARTIFACTORY_PASSWORD: "${{ secrets.ARTIFACTORY_PASSWORD }}"
+  ARTIFACTORY_TOKEN: "${{ secrets.ARTIFACTORY_TOKEN }}"
+  IMG_PULL_SECRET: |
+    imagePullSecrets:
+      - name: acrpull-secret
+  CONTAINER_REGISTRY: "${{ vars.CONTAINER_REGISTRY }}"
+  AZURE_CREDENTIALS: "${{ secrets.AZURE_CREDENTIALS }}"
+  VAULT_URL: "${{ vars.VAULT_URL }}"
+  VAULT_TOKEN: "${{ secrets.VAULT_TOKEN }}"
+  REPLICA: "${{ vars.REPLICA }}"
+  PLATFORM: "${{ github.event.inputs.target_platform }}"
+  ENVIRONMENT: "${{ github.event.inputs.environment }}"  
+  RESOURCE_GROUP: "${{ vars.AKS_RESOURCE_GROUP }}"
+  INSTANCE: "${{ github.event.inputs.target_instance }}"
+  APP_NAME: "${{ github.event.inputs.app_name }}"
+
+jobs:
+  setup-environment:
+    runs-on: self-hosted
+    environment: ${{ github.event.inputs.environment }}
+    steps:
+      - name: Extract Environment and Instance
+        id: extract_env
+        run: |
+          ENVIRONMENT=$(echo "${{ github.event.inputs.environment }}" | cut -d '.' -f 1)
+          INSTANCE=$(echo "${{ github.event.inputs.environment }}" | cut -d '.' -f 2)
+          ENV_NAME="${{ github.event.inputs.environment }}"
+          echo "ENV_NAME=${ENV_NAME}" >> $GITHUB_ENV
+          echo "ENVIRONMENT=$ENVIRONMENT" >> $GITHUB_ENV
+          echo "INSTANCE=$INSTANCE" >> $GITHUB_ENV
+      # Step 1: Checkout the repository (if needed)
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Debug Inputs
+        run: |
+            echo "Target Platform: ${{ github.event.inputs.target_platform }}"
+            echo "Target Environment: ${{ github.event.inputs.environment }}"
+            echo "Resource Group: ${{ github.event.inputs.resource_group }}"
+            echo "RESOURCE_GROUP: ${{ env.RESOURCE_GROUP }} "
+
+      - name: Setup Shell environment
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y wget apt-transport-https software-properties-common jq ca-certificates curl lsb-release gnupg unzip
+
+      - name: Install AZ CLI
+        run: |
+          sudo apt-get install -y ca-certificates curl apt-transport-https lsb-release gnupg
+          curl -sL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor | sudo tee /etc/apt/trusted.gpg.d/microsoft.gpg > /dev/null
+          AZ_REPO=$(lsb_release -cs)
+          echo "deb [arch=amd64] https://packages.microsoft.com/repos/azure-cli/ $AZ_REPO main" | sudo tee /etc/apt/sources.list.d/azure-cli.list
+          sudo apt-get update
+          sudo apt-get install -y azure-cli
+
+      - name: Set up kubelogin for non-interactive login
+        run: |
+          curl -LO https://github.com/Azure/kubelogin/releases/download/v0.1.3/kubelogin-linux-amd64.zip
+          unzip kubelogin-linux-amd64.zip
+          sudo install -o root -g root -m 0755 bin/linux_amd64/kubelogin /usr/local/bin/kubelogin
+
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+
+       # Step 2: Azure CLI login
+      - name: Test AZ CLI
+        run: |
+          az version
+          echo "AZ CLI is operational..."
+        
+      - name: Construct AZURE_CREDENTIALS
+        id: construct_credentials
+        run: |
+          echo "Constructing AZURE_CREDENTIALS JSON..."
+          echo '{}' | jq \
+            --arg clientId "${{ secrets.AZURE_CLIENT_ID }}" \
+            --arg clientSecret "${{ secrets.AZURE_CLIENT_SECRET }}" \
+            --arg subscriptionId "${{ secrets.AZURE_SUBSCRIPTION_ID }}" \
+            --arg tenantId "${{ secrets.AZURE_TENANT_ID }}" \
+            --arg activeDirectoryEndpointUrl "https://login.microsoftonline.com" \
+            --arg resourceManagerEndpointUrl "https://management.azure.com/" \
+            --arg activeDirectoryGraphResourceId "https://graph.windows.net/" \
+            --arg sqlManagementEndpointUrl "https://management.core.windows.net:8443/" \
+            --arg galleryEndpointUrl "https://gallery.azure.com/" \
+            --arg managementEndpointUrl "https://management.core.windows.net/" \
+            '.clientId=$clientId | .clientSecret=$clientSecret | .subscriptionId=$subscriptionId | .tenantId=$tenantId | .activeDirectoryEndpointUrl=$activeDirectoryEndpointUrl | .resourceManagerEndpointUrl=$resourceManagerEndpointUrl | .activeDirectoryGraphResourceId=$activeDirectoryGraphResourceId | .sqlManagementEndpointUrl=$sqlManagementEndpointUrl | .galleryEndpointUrl=$galleryEndpointUrl | .managementEndpointUrl=$managementEndpointUrl' \
+            > azure_credentials.json
+          echo "AZURE_CREDENTIALS<<EOF" >> $GITHUB_ENV
+          cat azure_credentials.json >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+          
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ env.AZURE_CREDENTIALS }}
+
+      - name: Configure AKS (if AKS)
+        if: ${{ github.event.inputs.target_platform == 'aks' }} 
+        uses: azure/aks-set-context@v4
+        with:
+          subscription: "${{ vars.AZURE_SUBSCRIPTION_ID }}"
+          #creds: ${{ env.AZURE_CREDENTIALS }}
+          resource-group: "${{ vars.AKS_RESOURCE_GROUP }}" # ${{ github.event.inputs.resource_group }} # ${{ env.AKS_RESOURCE_GROUP }} #INT-API-AKS-CUS-DEVQA #${{ github.event.inputs.resource_group }}
+          cluster-name: "${{ vars.AZURE_KUBERNETES }}" # INT-API-AKS-CUS-DEVQA #${{ github.event.inputs.cluster_names }}
+          admin: false  # Set to true if using admin credentials
+          use-kubelogin: true
+          
+      - name: Configure Rancher (if Rancher)
+        if: ${{ env.PLATFORM == 'rancher' }}
+        run: |
+          echo "Rancher selected. Decoding rancher kubeconfig..."
+          echo "${{ env.RANCHER_KUBECONFIG }}" | base64 --decode > kubeconfig
+          chmod 600 kubeconfig
+          export KUBECONFIG=$(pwd)/kubeconfig
+          kubectl cluster-info
+          
+      - name: Deploy Grafana Components
+        if: ${{ github.event.inputs.app_name == 'Grafana' }}
+        run: |
+          cd ./grafana
+          echo "ENV_NAME: ${ENV_NAME}"
+          
+          if [ "${{ env.PLATFORM }}" == "aks" ]; then
+             NAMESPACE="${NAMESPACE}"
+             echo "Namespace = ${NAMESPACE}"
+             echo "AKS is being used for Grafana"
+             # Replace variables in grafana.yaml
+             sed -i 's|@#acr#@|${{ vars.ACR_REGISTRY }}|g' grafana.yaml
+             sed -i 's|@#ns#@|${NAMESPACE}|g' grafana.yaml
+             sed -i "s|@#env#@|${ENV_NAME}|g"  grafana.yaml
+             # Handle multi-line value for image pull secret with proper formatting
+             awk '/@#imgpull#@/ {
+               print "      imagePullSecrets:"
+               print "      - name: acrpull-secret"
+               next
+             }1' grafana.yaml grafana-upd.yaml
+             # cp grafana.yaml grafana-upd.yaml
+
+             # Replace variables in ldap.toml
+             sed -i "s|@#bind_pass#@|${{ secrets.LDAP_PASS }}|g" ldap.toml
+             sed -i "s|@#env#@|${ENV_NAME}|g" ldap.toml
+             cp ldap.toml ldap1.toml
+
+             # Replace variables in grafana-ldap-config.yaml
+             sed -i 's|@#ns#@|${NAMESPACE}|g' grafana-ldap-config.yaml
+             sed -i 's|@#bind_pass#@|${{ secrets.LDAP_PASS }}|g' grafana-ldap-config.yaml
+             sed -i "s|@#env#@|${ENV_NAME}|g"  grafana-ldap-config.yaml
+             cp grafana-ldap-config.yaml grafana-ldap-configmap.yaml
+
+             # Replace variables in grafana_pvc.yaml
+             sed -i 's|@#ns#@|${NAMESPACE}|g' grafana_pvc.yaml
+             sed -i 's|@#sc#@|${{ secrets.STORAGE_CLASS }}|g' grafana_pvc.yaml
+             sed -i "s|@#env#@|${ENV_NAME}|g"  grafana_pvc.yaml
+             cp grafana_pvc.yaml grafana_pvc-upd.yaml
+
+             # Replace variables in grafana-service.yaml
+             sed -i 's|@#ns#@|${NAMESPACE}|g' grafana-service.yaml
+             sed -i "s|@#env#@|${ENV_NAME}|g"  grafana-service.yaml
+             cp grafana-service.yaml grafana_svc-upd.yaml
+
+             # Replace variables in grafana-vsr.yaml
+             sed -i 's|@#ns#@|${NAMESPACE}|g' grafana-vsr.yaml
+             sed -i "s|@#env#@|${ENV_NAME}|g"  grafana-vsr.yaml
+             cp grafana-vsr.yaml vsr.yaml
+
+             #  Apply the updated YAML files
+             kubectl apply -f grafana-upd.yaml
+             kubectl apply -f grafana-ldap-configmap.yaml
+             kubectl apply -f grafana_pvc-upd.yaml
+             kubectl apply -f grafana_svc-upd.yaml
+             kubectl apply -f vsr.yaml
+             
+          #  kubelogin convert-kubeconfig -l azurecli
+          elif [ "${{ env.PLATFORM }}" == "rancher" ]; then
+             NAMESPACE="${{ env.ENV_NAME }}-monitor"
+             echo "Rancher is being used"
+             # Replace variables in grafana.yaml
+             sed -i 's|@#acr#@|${{ vars.ACR_REGISTRY }}|g' grafana.yaml
+             sed -i 's|@#ns#@|${NAMESPACE}|g' grafana.yaml
+             sed -i "s|@#env#@|${ENV_NAME}|g"  grafana.yaml
+             awk '/@#imgpull#@/ {
+               print "      imagePullSecrets:"
+               print "      - name: acrpull-secret"
+               next
+             }1' grafana.yaml grafana-upd.yaml
+
+             # Replace variables in ldap.toml
+             sed -i "s|@#bind_pass#@|${{ secrets.LDAP_PASS }}|g" ldap.toml
+             sed -i "s|@#env#@|${ENV_NAME}|g"  ldap.toml
+             cp ldap.toml ldap1.toml
+
+             # Replace variables in grafana-ldap-config.yaml
+             sed -i 's|@#ns#@|${NAMESPACE}|g' grafana-ldap-config.yaml
+             sed -i 's|@#bind_pass#@|${{ secrets.LDAP_PASS }}|g' grafana-ldap-config.yaml
+             sed -i "s|@#env#@|${ENV_NAME}|g"  grafana-ldap-config.yaml
+             cp grafana-ldap-config.yaml grafana-ldap-configmap.yaml
+
+             # Replace variables in grafana_pvc.yaml
+             sed -i 's|@#ns#@${NAMESPACE}|g' grafana_pvc.yaml
+             sed -i 's|@#sc#@|${{ secrets.RANCHER_STORAGE_CLASS }}|g' grafana_pvc.yaml
+             sed -i "s|@#env#@|${ENV_NAME}|g"  grafana_pvc.yaml
+             cp grafana_pvc.yaml grafana_pvc-upd.yaml
+
+             # Replace variables in grafana-service.yaml
+             sed -i 's|@#ns#@|${NAMESPACE}|g' grafana-service.yaml
+             sed -i "s|@#env#@|${ENV_NAME}|g"  grafana-service.yaml
+             cp grafana-service.yaml grafana_svc-upd.yaml
+
+             # Replace variables in grafana-vsr.yaml
+             sed -i 's|@#ns#@|${NAMESPACE}|g' grafana-vsr.yaml
+             sed -i "s|@#env#@|${ENV_NAME}|g"  grafana-vsr.yaml
+             sed -i 's|@#host#@|${{ secrets.RANCHER_INGRESS_MONITOR_HOSTNAME }}|g' grafana-vsr.yaml
+             cp grafana-vsr.yaml vsr.yaml
+
+             # Apply the updated YAML files
+             if [ "${{ github.event.inputs.apply_grafana_yml }}" == "true" ]; then
+               kubectl apply -f grafana-upd.yaml
+             else
+              echo "Skipping grafana-upd.yaml apply."
+             fi
+             if [ "${{ github.event.inputs.apply_grafana-ldap-configmap }}" == "true" ]; then
+               kubectl apply -f grafana-ldap-configmap.yaml
+             else
+               echo "Skipping grafana-upd.yaml apply."
+             fi
+             if [ "${{ github.event.inputs.apply_grafana_pvc }}" == "true" ]; then
+               kubectl apply -f grafana_pvc-upd.yaml
+             else
+               echo "Skipping grafana-upd.yaml apply."
+             fi
+             if [ "${{ github.event.inputs.apply_grafana_svc }}" == "true" ]; then
+               kubectl apply -f grafana_svc-upd.yaml
+             else
+               echo "Skipping grafana-upd.yaml apply."
+             fi
+             if [ "${{ github.event.inputs.apply_grafana_vsr }}" == "true" ]; then
+               kubectl apply -f vsr.yaml
+             else
+               echo "Skipping grafana-upd.yaml apply."
+             fi
+           fi
+      - name: Deploy Fluentd
+        if: ${{ github.event.inputs.app_name == 'Fluentd' }}
+        run: |
+          echo "Deploying Fluentd..."
+          cd ./fluentd
+          ls -lhart
+          
+          ####################
+          # Retrieve password from ES (optional)
+          ####################
+          FLUENTD_PASSWORD="$(kubectl get secret es-es-elastic-user -n elastic-system -o go-template='{{.data.elastic}}' | base64 --decode)"
+          echo "Elasticsearch password retrieved."
+          
+          ####################
+          # 1) Process and apply fluentd_secret.yaml
+          ####################
+          SECRET_FILE="./fluentd_secret.yaml"
+          if [ -f "$SECRET_FILE" ]; then
+            echo "Preparing secret file: $SECRET_FILE"
+            # Copy to a working file
+            cp "$SECRET_FILE" ./secret-processed.yaml
+            
+            # For a more secure approach, store your user/password placeholders as base64 in the repo,
+            # then decode them here. Otherwise, if you prefer plain text, keep as is:
+            sed -i "s|@#env#@|${ENVIRONMENT}|g" secret-processed.yaml
+            sed -i "s|@#password#@|${FLUENTD_PASSWORD}|g" secret-processed.yaml
+            # If you also have a @#fluentduser#@ placeholder, handle it similarly
+            # sed -i "s|@#fluentduser#@|${BASE64_ENCODED_USERNAME:-someUser}|g" secret-processed.yaml
+            echo "Updated secret:"
+            cat secret-processed.yaml
+            
+            echo "Applying secret..."
+            if ! kubectl apply -f secret-processed.yaml; then
+              echo "Warning: Failed to apply secret file."
+            fi
+          else
+            echo "Warning: No secret file found at $SECRET_FILE"
+          fi
+          
+          ####################
+          # 2) Pick the correct DaemonSet YAML based on PLATFORM
+          ####################
+          if [ "${{ env.PLATFORM }}" == "aks" ]; then
+            DEPLOYMENT_FILE="./fluentd_elastic.yaml"
+          else
+            export KUBECONFIG="${HOME}/.kube/config-rancher-np"
+            DEPLOYMENT_FILE="./fluentd_elastic_rancher.yaml"
+          fi
+          
+          if [ ! -f "$DEPLOYMENT_FILE" ]; then
+            echo "Error: No deployment file found at $DEPLOYMENT_FILE"
+            exit 0
+          fi
+          
+          echo "Preparing DaemonSet file: $DEPLOYMENT_FILE"
+          cp "$DEPLOYMENT_FILE" ./fluentd-processed.yaml
+          
+          # -- Perform SED replacements for single-line placeholders --
+          sed -i "s|@#env#@|${ENVIRONMENT}|g" fluentd-processed.yaml
+          sed -i "s|@#acr#@|${{ vars.ACR_REGISTRY }}|g" fluentd-processed.yaml
+          sed -i "s|@#environment#@|${ENVIRONMENT}${INSTANCE}|g" fluentd-processed.yaml
+          # If you have other placeholders like @#fluentduser#@ or @#fluentdpassword#@, handle similarly
+          # sed -i "s|@#fluentduser#@|${USERNAME}|g" ...
+          # sed -i "s|@#fluentdpassword#@|${BASE64PWD}|g" ...
+          
+          # -- Handle multiline imagePullSecrets with awk --
+          awk '/@#imgpull#@/ {
+              print "      imagePullSecrets:"
+              print "      - name: acrpull-secret"
+              next
+          }1' fluentd-processed.yaml > manifest.yaml
+          
+          echo "Final DaemonSet manifest:"
+          cat manifest.yaml
+          
+          ####################
+          # 3) Apply manifest
+          ####################
+          echo "Applying Fluentd DaemonSet..."
+          if kubectl apply -f manifest.yaml; then
+            echo "Fluentd DaemonSet applied successfully."
+          else
+            echo "Warning: Failed to apply Fluentd DaemonSet."
+          fi
+          
+          ####################
+          # 4) (Optional) Wait, then verify rollout
+          ####################
+          echo "Waiting 15 seconds for pods to start..."
+          sleep 15
+          
+          # You might name your DaemonSet differently for each environment, but if it's always "fluentd-<env>"
+          # you can do a partial rollout check like:
+          FLUENTD_DAEMONSET="fluentd-${ENVIRONMENT}"
+          echo "Verifying DaemonSet rollout: $FLUENTD_DAEMONSET ..."
+          # kubectl rollout status doesn't work natively for DaemonSets in older versions,
+          # so we might do a get ds and check desired vs. available, or simply get pods:
+          READY_PODS="$(kubectl get ds "$FLUENTD_DAEMONSET" -n kube-system -o jsonpath='{.status.numberReady}')"
+          DESIRED_PODS="$(kubectl get ds "$FLUENTD_DAEMONSET" -n kube-system -o jsonpath='{.status.desiredNumberScheduled}')"
+          if [ "$READY_PODS" == "$DESIRED_PODS" ]; then
+            echo "Fluentd DaemonSet rollout successful ($READY_PODS/$DESIRED_PODS)!"
+          else
+            echo "Warning: Fluentd DaemonSet not fully ready ($READY_PODS/$DESIRED_PODS)."
+            # exit 1 if you want to fail the pipeline if not all are ready
+          fi
+          echo "Fluentd deployment process completed."
+
+      - name: Deploy Rabbitmq Components
+        if: ${{ github.event.inputs.app_name == 'Rabbitmq' }}
+        run: |
+          echo "Deploying RabbitMQ on Rancher..."
+          cd ./rabbitmq
+
+          ENV_NAME="${{ env.ENVIRONMENT }}.${{ env.INSTANCE }}"
+          echo "ENV_NAME: $ENV_NAME"
+
+          ########################
+          # 1) cluster-operator.yaml
+          ########################
+          if [ -f "./cluster-operator.yaml" ]; then
+            echo "Processing cluster-operator.yaml..."
+            cp ./cluster-operator.yaml ./cluster-operator-processed.yaml
+
+            # Single-line replacements
+            sed -i "s|@#acr#@|${{ vars.ACR_REGISTRY }}|g" ./cluster-operator-processed.yaml
+            sed -i "s|@#ns#@|${ENV_NAME}-msging|g" ./cluster-operator-processed.yaml
+
+            # AWK multiline insertion for @#imgpull#@
+           awk '/@#imgpull#@/ {
+                print "      imagePullSecrets:"
+                print "      - name: acrpull-secret"
+                next
+            }1' cluster-operator-processed.yaml > cluster-operator-final.yaml
+
+            echo "Final cluster-operator YAML:"
+            cat cluster-operator-final.yaml
+
+            if [ "${{ github.event.inputs.apply_rmq_operator }}" == "true" ]; then
+              kubectl apply -f cluster-operator-final.yaml
+            else
+              echo "Skipping cluster-operator apply."
+            fi
+          fi
+
+          ########################
+          # 2) rabbitmq.yaml
+          ########################
+          if [ -f "./rabbitmq.yaml" ]; then
+            echo "Processing rabbitmq.yaml..."
+            cp ./rabbitmq.yaml ./rabbitmq-processed.yaml
+
+            sed -i "s|@#env#@|${ENV_NAME}|g" ./rabbitmq-processed.yaml
+            sed -i "s|@#acr#@|${{ vars.ACR_REGISTRY }}|g" ./rabbitmq-processed.yaml
+            sed -i "s|@#ns#@|${ENV_NAME}-msging|g" ./rabbitmq-processed.yaml
+            sed -i "s|@#sc#@|${{ secrets.RANCHER_STORAGE_CLASS }}|g" ./rabbitmq-processed.yaml
+
+            awk '/@#imgpull#@/ {
+                print "      imagePullSecrets:"
+                print "      - name: acrpull-secret"
+                next
+            }1' rabbitmq-processed.yaml > rabbitmq-final.yaml
+
+            echo "Final rabbitmq YAML:"
+            cat rabbitmq-final.yaml
+
+            if [ "${{ github.event.inputs.apply_rmq_cluster }}" == "true" ]; then
+              kubectl apply -f rabbitmq-final.yaml
+            else
+              echo "Skipping rabbitmq cluster apply."
+            fi
+          fi
+
+          ########################
+          # 3) rabbitmq-vsr.yaml
+          ########################
+          if [ -f "./rabbitmq-vsr.yaml" ]; then
+            echo "Processing rabbitmq-vsr.yaml..."
+            cp ./rabbitmq-vsr.yaml ./rabbitmq-vsr-processed.yaml
+
+            sed -i "s|@#env#@|${ENV_NAME}|g" ./rabbitmq-vsr-processed.yaml
+            sed -i "s|@#host#@|${{ vars.RANCHER_INGRESS_MONITOR_HOSTNAME }}|g" ./rabbitmq-vsr-processed.yaml
+            sed -i "s|@#ns#@|${ENV_NAME}-msging|g" ./rabbitmq-vsr-processed.yaml
+
+            # In the VSR file, there's no @#imgpull#@ placeholder. If you do have one, handle with awk
+            # For demonstration, we'll handle it if it exists:
+           awk '/@#imgpull#@/ {
+                print "      imagePullSecrets:"
+                print "      - name: acrpull-secret"
+                next
+            }1' rabbitmq-vsr-processed.yaml > rabbitmq-vsr-final.yaml
+
+            echo "Final rabbitmq-vsr YAML:"
+            cat rabbitmq-vsr-final.yaml
+
+            if [ "${{ github.event.inputs.apply_rmq_vsr }}" == "true" ]; then
+              kubectl apply -f rabbitmq-vsr-final.yaml
+            else
+              echo "Skipping rabbitmq-vsr apply."
+            fi
+          fi
+
+          echo "RabbitMQ deployment step complete."
