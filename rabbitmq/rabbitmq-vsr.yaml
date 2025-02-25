@@ -1,0 +1,33 @@
+apiVersion: k8s.nginx.org/v1
+kind: VirtualServer
+metadata:
+  name: rabbitmq
+  namespace: @#ns#@
+spec:
+  host: @#host#@
+  tls:
+    secret: rabbitmq-tls-@#env#@
+  routes:
+  - path: /rabbitmq/
+    route: rabbitmq-@#env#@
+---
+apiVersion: k8s.nginx.org/v1
+kind: VirtualServerRoute
+metadata:
+  name: rabbitmq-@#env#@
+  namespace: @#ns#@
+  labels:
+    app.kubernetes.io/name: "rabbitmq-mgmt"
+    app.kubernetes.io/instance: "rabbitmq-@#env#@"
+spec:
+  host: @#host#@
+  subroutes:
+    - action:
+        proxy:
+          rewritePath: /
+          upstream: rabbitmq
+      path: /rabbitmq/
+  upstreams:
+    - name: rabbitmq
+      port: 15672
+      service: rabbitmqcluster

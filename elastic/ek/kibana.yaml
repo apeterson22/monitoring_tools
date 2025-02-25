@@ -1,0 +1,65 @@
+apiVersion: kibana.k8s.elastic.co/v1
+kind: Kibana
+metadata:
+  name: kb
+  namespace: @#ns#@
+spec:
+  version: 8.12.2
+  count: 2
+  podTemplate:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nodeType
+                    operator: In
+                    values:
+                      - general
+      containers:
+        - name: kibana-@#env#@
+          readinessProbe:
+            failureThreshold: 3
+            httpGet:
+              path: /kibana/login
+              port: 5601
+              scheme: HTTP
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /kibana/login
+              port: 5601
+              scheme: HTTP
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+          env:
+            - name: NODE_OPTIONS
+              value: "--max-old-space-size=2048"
+            - name: SERVER_BASEPATH
+              value: "/kibana"
+            - name: SERVER_REWRITEBASEPATH
+              value: "true"
+            - name: ENTERPRISE_SEARCH_HOST
+              value: "https://es-es-http.@#ns#@.svc.cluster.local"
+          resources:
+            requests:
+              memory: 2.5Gi
+              cpu: 500m
+            limits:
+              memory: 2.5Gi
+              cpu: 2000m
+      @#imgpull#@
+  http:
+    tls:
+      selfSignedCertificate:
+        disabled: true
+    service:
+      spec:
+        type: ClusterIP
+  elasticsearchRef:
+    name: es
+    namespace: @#ns#@

@@ -1,0 +1,18 @@
+apiVersion: k8s.nginx.org/v1
+kind: VirtualServerRoute
+metadata:
+  name: grafana
+  namespace: @#ns#@
+  labels:
+    app.kubernetes.io/name: grafana
+    app.kubernetes.io/instance: "grafana-@#env#@"
+spec:
+  host: @#host#@
+  upstreams:
+  - name: grafana
+    service: grafana-@#env#@
+    port: 3000
+  subroutes:
+  - path: /grafana/
+    action:
+      pass: grafana

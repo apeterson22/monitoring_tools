@@ -1,0 +1,60 @@
+[[servers]]
+# LDAP server host (specify multiple hosts space separated)
+host = "ldapvip1.ssc.tsc"
+# Default port is 389 or 636 if use_ssl = true
+port = 389
+# Set to true if LDAP server supports TLS
+use_ssl = true
+# Set to true if connect LDAP server with STARTTLS pattern (create connection in insecure, then upgrade to secure connection with TLS)
+start_tls = true
+# Set to true if skip LDAP server cert validation
+ssl_skip_verify = false
+
+tls_ciphers = []
+# Set root CA certificate for LDAP server
+root_ca_cert = "/etc/grafana/cert/TSCRootCA.cer"
+client_cert = "/etc/grafana/ssl/tls.crt"
+client_key = "/etc/grafana/ssl/tls.key"
+
+# Bind DN for initial LDAP bind
+# Example: bind_dn = "cn=admin,dc=example,dc=org"
+bind_dn = "CN=svcEDF,OU=TSCServiceAccounts,DC=ssc,DC=tsc"
+# Bind password for initial LDAP bind
+bind_password = '@#bind_pass#@'
+
+# User search settings
+# Base DN to start the search from
+# search_base_dns = ["ou=tscusers,dc=ssc,dc=tsc"]
+# LDAP search filter to find users (optional, default: "(cn=%s)")
+search_filter = "(sAMAccountName=%s)"
+# An array of base dns to search through
+search_base_dns = ["DC=ssc,DC=tsc"]
+# An array of base dns to search through for groups. Only supports one for now
+# group_search_base_dns = ["ou=TSC Distribution Lists,dc=ssc,dc=tsc"]
+# Optional group filter, for filtering groups from the search results
+# group_search_filter = "(&(objectClass=posixGroup)(memberUid=%s))"
+
+# Specify names of the ldap attributes your ldap uses
+[servers.attributes]
+name = "givenName"
+surname = "sn"
+username = "sAMAccountName"
+member_of = "memberOf"
+email =  "mail"
+
+# Map ldap groups to grafana org roles
+[[servers.group_mappings]]
+group_dn = "OU=TSCSuperUsers,DC=ssc,DC=tsc"
+org_role = "Admin"
+grafana_admin = true
+# To make user an Org Admin in Grafana, specify the org_id, like this:
+# org_id = 1
+
+[[servers.group_mappings]]
+group_dn = "OU=IT,OU=TSCUsers,DC=ssc,DC=tsc"
+org_role = "Editor"
+
+[[servers.group_mappings]]
+# If you want to match all (or no ldap groups) then you can use wildcard
+group_dn = "*"
+org_role = "Viewer"

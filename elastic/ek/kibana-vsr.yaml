@@ -1,0 +1,28 @@
+apiVersion: k8s.nginx.org/v1
+kind: VirtualServer
+metadata:
+  name: kibana
+  namespace: @#ns#@
+spec:
+  host: @#host#@
+  tls:
+    secret: kibana-tls
+  routes:
+    - path: /kibana/
+      route: kibana-@#env#@
+---
+apiVersion: k8s.nginx.org/v1
+kind: VirtualServerRoute
+metadata:
+  name: kibana-@#env#@
+  namespace: @#ns#@
+spec:
+  host: @#host#@
+  upstreams:
+  - name: kibana-@#env#@
+    service: kb-kb-http
+    port: 5601
+  subroutes:
+  - path: /kibana/
+    action:
+      pass: kibana-@#env#@

@@ -1,0 +1,134 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana-@#env#@
+  namespace: @#ns#@
+  app.kubernetes.io/name: "grafana"
+  app.kubernetes.io/instance: "grafana-@#env#@"
+  app.kubernetes.io/part-of: "monitoring"
+  app.kubernetes.io/version: "9.3.2"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: "grafana"
+      app.kubernetes.io/instance: "grafana-@#env#@"
+      app.kubernetes.io/part-of: "monitoring"
+      app.kubernetes.io/version: "9.3.2"
+  template:
+    metadata:
+      name: grafana-@#env#@
+      labels:
+        app.kubernetes.io/name: "grafana"
+        app.kubernetes.io/instance: "grafana-@#env#@"
+        app.kubernetes.io/part-of: "monitoring"
+        app.kubernetes.io/version: "9.3.2"
+    spec:
+      strategy:
+        type: RollingUpdate
+        rollingUpdate:
+          maxUnavailable: 1
+          maxSurge: 1
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nodeType
+                    operator: In
+                    values:
+                      - general
+      @#imgpull#@
+      containers:
+        - name: grafana-@#env#@
+          image: @#acr#@.azurecr.io/grafana:v9.3.2
+          readinessProbe:
+            httpGet:
+              path: /login
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: 3000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+
+          env:
+            - name: K8S_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: GF_LOG_FILTER
+              value: "ldap:debug"
+            - name: GH_AUTH_BASIC_ENABLED
+              value: "true"
+            - name: GF_AUTH_LDAP_ENABLED
+              value: "true"
+            - name: GF_OAUTH_ALLOW_INSECURE_EMAIL_LOOKUP
+              value: "false"
+            - name: GF_OAUTH_AUTO_LOGIN_ENABLED
+              value: "false"
+            - name: GF_AUTH_ANONYMOUS_ENABLED
+              value: "false"
+            - name: GF_AUTH_ANONYMOUS_ORG_ROLE
+              value: "Viewer"
+            - name: GF_AUTH_LDAP_CONFIG_FILE
+              value: "/etc/grafana/ldap.toml"
+            - name: GF_SERVER_SERVE_FROM_SUB_PATH
+              value: "true"
+            - name: GF_SERVER_ROOT_URL
+              value: "%(protocol)s://%(domain)s:%(http_port)s/grafana"
+            - name: GF_AUTH_GENERIC_OAUTH_TLS_SKIP_VERIFY_INSECURE
+              value: "false"
+            - name: GF_SERVER_CERT_FILE
+              value: "/etc/grafana/cert/TSCRootCA.cer"
+            - name: GF_ACTIVE_SYNC_ENABLED
+              value: "false"
+            - name: GF_LOG_LEVEL
+              value: "debug"
+            - name: GF_INSTALL_PLUGINS
+              value: "marcusolsson-json-datasource,grafana-github-datasource,grafana-clock-panel,grafana-simple-json-datasource,fifemon-graphql-datasource"
+          ports:
+            - name: grafana-@#env#@
+              containerPort: 3000
+          resources:
+            limits:
+              memory: "4Gi"
+              cpu: "4000m"
+            requests:
+              memory: "4Gi"
+              cpu: "2000m"
+          volumeMounts:
+            - mountPath: /var/lib/grafana
+              name: grafana-storage-@#env#@
+            - mountPath: /etc/grafana/ldap.toml
+              name: grafana-ldap-config-@#env#@
+              subPath: ldap.toml
+            - name: ca-cert-root-@#env#@
+              mountPath: /etc/grafana/ssl
+              readOnly: true
+            - name: grafana-ldap-root-ca-cert-@#env#@
+              mountPath: /etc/grafana/cert
+              readOnly: true
+          securityContext:
+            runAsUser: 472  # grafana default user ID
+            runAsGroup: 0   # or a non-root group if your cluster supports it
+      volumes:
+        - name: grafana-storage-@#env#@
+          persistentVolumeClaim:
+            claimName: grafana-pvc-@#env#@
+        - name: grafana-ldap-config-@#env#@
+          configMap:
+            name: grafana-ldap-config-@#env#@
+        - name: ca-cert-root-@#env#@
+          secret:
+            secretName: ldap-root-cacert-@#env#@
+        - name: grafana-ldap-root-ca-cert-@#env#@
+          secret:
+            secretName: grafana-ldap-root-ca-cert-@#env#@
+            items:
+              - key: TSCRootCA.cer
+                path: TSCRootCA.cer

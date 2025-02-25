@@ -1,0 +1,87 @@
+apiVersion: elasticsearch.k8s.elastic.co/v1
+kind: Elasticsearch
+metadata:
+  name: es
+  namespace: @#ns#@
+  labels:
+    app.kubernetes.io/name: "elasticsearch"
+    app.kubernetes.io/part-of: "elastic-stack"
+    app.kubernetes.io/version: "8.12.2"
+spec:
+  version: 8.12.2
+  http: 
+    tls:
+      selfSignedCertificate:
+        subjectAltNames:
+        - dns: es-es-http.@#ns#@.svc.cluster.local
+    service:
+      spec: 
+        type: ClusterIP
+  nodeSets:
+    # Master nodes
+    - name: master
+      count: 3
+      config:
+        node.roles: ["master"]
+      podTemplate:
+        spec:
+          affinity:
+            nodeAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                nodeSelectorTerms:
+                  - matchExpressions:
+                      - key: nodeType
+                        operator: In
+                        values:
+                          - general
+          containers:
+            - name: elasticsearch
+              resources:
+                requests:
+                  memory: 2Gi
+                  cpu: 1
+                limits:
+                  memory: 4Gi
+                  cpu: 2
+      volumeClaimTemplates:
+        - metadata:
+            name: elasticsearch-data
+          spec:
+            accessModes: ["ReadWriteOnce"]
+            resources:
+              requests:
+                storage: 50Gi
+            storageClassName: @#sc#@
+
+    # Data nodes
+    - name: data-hot
+      count: 3
+      config:
+        node.roles: ["data_hot","ingest"]
+        node.store.allow_mmap: false
+        http.cors.enabled: true
+        http.cors.allow-origin: "*"
+        http.cors.allow-credentials: true
+        http.cors.allow-headers: X-Requested-With, X-Auth-Token, Content-Type, Content-Length, Authorization, Access-Control-Allow-Headers, Accept
+      podTemplate:
+        spec:
+          securityContext:
+            fsGroup: 1000
+          containers:
+            - name: elasticsearch
+              resources:
+                requests:
+                  memory: 16Gi
+                  cpu: 2
+                limits:
+                  memory: 16Gi
+                  cpu: 4
+      volumeClaimTemplates:
+        - metadata:
+            name: elasticsearch-data
+          spec:
+            accessModes: ["ReadWriteOnce"]
+            resources:
+              requests:
+                storage: 500Gi
+            storageClassName: @#sc#@
